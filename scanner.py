@@ -22,7 +22,7 @@ from datetime import datetime, timezone
 
 import requests
 
-SPOT_BASE = "https://api.binance.com"
+SPOT_BASE = "https://data-api.binance.vision"
 FUTURES_BASE = "https://fapi.binance.com"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
