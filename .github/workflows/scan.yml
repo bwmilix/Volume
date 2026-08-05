@@ -24,6 +24,6 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           MARKET: spot
           INTERVAL: 5m
-          RVOL_THRESHOLD: "3"
-          PCT_THRESHOLD: "1.5"
+          TOP_N: "10"
+          MIN_VOLUME_USDT: "50000"
         run: python scanner.py
