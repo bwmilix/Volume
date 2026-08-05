@@ -1,19 +1,7 @@
 """
-Single-run Binance volume spike scanner, designed to be triggered
-repeatedly by GitHub Actions (or any external scheduler) instead of
-looping forever. Each run scans once and exits.
-
-Configuration is read from environment variables so secrets (like the
-Telegram token) never need to be written into the code:
-
-    TELEGRAM_TOKEN     - required, your bot token from BotFather
-    TELEGRAM_CHAT_ID   - required, your Telegram chat id
-    MARKET             - optional, "spot" or "futures" (default: spot)
-    INTERVAL           - optional, candle timeframe (default: 5m)
-    RVOL_THRESHOLD     - optional, minimum relative volume multiplier (default: 3)
-    PCT_THRESHOLD      - optional, minimum absolute price change % (default: 1.0)
-    LOOKBACK           - optional, candles used for average volume baseline (default: 20)
-    QUOTE              - optional, quote asset filter (default: USDT)
+Single-run Binance 5m top-movers scanner for GitHub Actions.
+Reports the coins with the largest absolute price change in the last
+5-minute candle, ranked against all other coins (not a fixed threshold).
 """
 
 import os
@@ -26,29 +14,13 @@ SPOT_BASE = "https://data-api.binance.vision"
 FUTURES_BASE = "https://fapi.binance.com"
 TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
 
-
-def env_float(name, default):
-    try:
-        return float(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
-
-
-def env_int(name, default):
-    try:
-        return int(os.environ.get(name, default))
-    except (TypeError, ValueError):
-        return default
-
-
 TOKEN = os.environ["TELEGRAM_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 MARKET = os.environ.get("MARKET", "spot")
 INTERVAL = os.environ.get("INTERVAL", "5m")
-RVOL_THRESHOLD = env_float("RVOL_THRESHOLD", 3.0)
-PCT_THRESHOLD = env_float("PCT_THRESHOLD", 1.0)
-LOOKBACK = env_int("LOOKBACK", 20)
 QUOTE = os.environ.get("QUOTE", "USDT")
+TOP_N = int(os.environ.get("TOP_N", "10"))
+MIN_VOLUME_USDT = float(os.environ.get("MIN_VOLUME_USDT", "50000"))
 
 
 def send_telegram_message(text: str):
@@ -62,16 +34,11 @@ def send_telegram_message(text: str):
         print(f"[Telegram error] {e}")
 
 
-def get_symbols(market: str, quote: str):
-    if market == "spot":
-        url = f"{SPOT_BASE}/api/v3/exchangeInfo"
-    else:
-        url = f"{FUTURES_BASE}/fapi/v1/exchangeInfo"
-
+def get_symbols(market, quote):
+    url = f"{SPOT_BASE}/api/v3/exchangeInfo" if market == "spot" else f"{FUTURES_BASE}/fapi/v1/exchangeInfo"
     resp = requests.get(url, timeout=15)
     resp.raise_for_status()
     data = resp.json()
-
     symbols = []
     for s in data["symbols"]:
         if market == "spot":
@@ -83,79 +50,66 @@ def get_symbols(market: str, quote: str):
     return symbols
 
 
-def get_klines(market: str, symbol: str, interval: str, limit: int):
-    if market == "spot":
-        url = f"{SPOT_BASE}/api/v3/klines"
-    else:
-        url = f"{FUTURES_BASE}/fapi/v1/klines"
-
-    params = {"symbol": symbol, "interval": interval, "limit": limit}
+def get_last_kline(market, symbol, interval):
+    url = f"{SPOT_BASE}/api/v3/klines" if market == "spot" else f"{FUTURES_BASE}/fapi/v1/klines"
+    params = {"symbol": symbol, "interval": interval, "limit": 2}
     resp = requests.get(url, params=params, timeout=10)
     if resp.status_code != 200:
         return None
     return resp.json()
 
 
-def analyze_symbol(klines, rvol_threshold, pct_threshold):
-    if not klines or len(klines) < 6:
+def analyze(kline):
+    if not kline or len(kline) < 1:
         return None
-
-    last = klines[-1]
-    previous = klines[:-1]
-
-    last_open = float(last[1])
-    last_close = float(last[4])
-    last_volume = float(last[5])
-
-    avg_volume = sum(float(k[5]) for k in previous) / len(previous)
-    if avg_volume == 0:
+    last = kline[-1]
+    open_p = float(last[1])
+    close_p = float(last[4])
+    volume = float(last[5])
+    quote_volume = float(last[7])  # volume in quote asset (USDT)
+    if open_p == 0:
         return None
-
-    rvol = last_volume / avg_volume
-    pct_change = (last_close - last_open) / last_open * 100
-
-    if rvol >= rvol_threshold and abs(pct_change) >= pct_threshold:
-        return {
-            "rvol": round(rvol, 2),
-            "pct_change": round(pct_change, 2),
-            "close": last_close,
-            "candle_time": datetime.fromtimestamp(last[0] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
-        }
-    return None
+    pct_change = (close_p - open_p) / open_p * 100
+    candle_time = datetime.fromtimestamp(last[0] / 1000, tz=timezone.utc).strftime("%H:%M UTC")
+    return {
+        "pct_change": round(pct_change, 2),
+        "close": close_p,
+        "volume_usdt": quote_volume,
+        "candle_time": candle_time,
+    }
 
 
 def main():
     symbols = get_symbols(MARKET, QUOTE)
-    print(f"Scanning {len(symbols)} symbols on {MARKET} / {INTERVAL} "
-          f"(RVOL>={RVOL_THRESHOLD}x, |change|>={PCT_THRESHOLD}%)")
+    print(f"Scanning {len(symbols)} symbols on {MARKET} / {INTERVAL}")
 
-    hits = []
+    results = []
     for i, symbol in enumerate(symbols):
-        klines = get_klines(MARKET, symbol, INTERVAL, LOOKBACK + 1)
-        result = analyze_symbol(klines, RVOL_THRESHOLD, PCT_THRESHOLD)
-        if result:
-            result["symbol"] = symbol
-            hits.append(result)
+        kline = get_last_kline(MARKET, symbol, INTERVAL)
+        info = analyze(kline)
+        if info and info["volume_usdt"] >= MIN_VOLUME_USDT:
+            info["symbol"] = symbol
+            results.append(info)
         if i % 20 == 0:
             time.sleep(0.2)
 
-    hits.sort(key=lambda x: x["rvol"], reverse=True)
-
-    if not hits:
-        print("No matches this run.")
+    if not results:
+        print("No data collected this run.")
         return
 
-    for h in hits:
-        direction = "🟢 UP" if h["pct_change"] > 0 else "🔴 DOWN"
-        msg = (
-            f"⚡ <b>Volume Spike</b> - {h['symbol']}\n"
-            f"{direction} {h['pct_change']}%\n"
-            f"RVOL: {h['rvol']}x\n"
-            f"Close: {h['close']}\n"
-            f"Candle: {h['candle_time']}"
+    results.sort(key=lambda x: abs(x["pct_change"]), reverse=True)
+    top = results[:TOP_N]
+
+    lines = [f"📊 <b>Top {len(top)} movers (5m)</b>"]
+    for r in top:
+        direction = "🟢" if r["pct_change"] > 0 else "🔴"
+        lines.append(
+            f"{direction} <b>{r['symbol']}</b> {r['pct_change']}% | "
+            f"Vol: {int(r['volume_usdt']):,} USDT | Close: {r['close']}"
         )
-        print(msg.replace("\n", " | "))
-        send_telegram_message(msg)
+    msg = "\n".join(lines)
+    print(msg.replace("\n", " | "))
+    send_telegram_message(msg)
 
 
 if __name__ == "__main__":
